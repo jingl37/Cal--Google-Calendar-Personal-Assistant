@@ -1,0 +1,29 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Google OAuth credentials and user tokens
+credentials.json
+token.json
+**/credentials.json
+**/token.json
+
+# Private user data
+backend/data/*.json
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# JavaScript generated files
+node_modules/
+dist/
+
+# Editor and operating-system files
+.DS_Store
+.vscode/
+.idea/
+
