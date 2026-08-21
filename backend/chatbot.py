@@ -56,10 +56,19 @@ SUPPORTED_SCHEDULE_TYPES = {"application/pdf", "image/jpeg", "image/png", "image
 MAX_SCHEDULE_SIZE = 15 * 1024 * 1024
 MAX_SAVED_PREVIEW_SIZE = 3 * 1024 * 1024
 
-# Let the Vite frontend call this API during local development.
+# Let the local Vite app and the deployed frontend call this API.
+frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+allowed_origins = [
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if frontend_url:
+    allowed_origins.append(frontend_url)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5174", "http://127.0.0.1:5174", "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
