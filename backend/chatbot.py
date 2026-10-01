@@ -1,18 +1,21 @@
 import json
 import os
 import base64
+import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from calendar_assist import (
     create_new_calendar_event,
@@ -21,14 +24,13 @@ from calendar_assist import (
     get_calendar_free_slot,
     get_calendar_service,
     is_calendar_slot_free,
+    list_events_in_window,
     update_calendar_event,
     set_calendar_credentials,
 )
 
-# Keep saved chat memory beside the backend, regardless of where the server is started.
+# Load the shared .env before importing modules that read settings at import time.
 BACKEND_DIR = Path(__file__).resolve().parent
-MEMORY_PATH = BACKEND_DIR / "data" / "conversations.json"
-PROFILE_PATH = BACKEND_DIR / "data" / "profile.json"
 load_dotenv(BACKEND_DIR.parent / ".env")
 
 from supabase_store import (
@@ -41,16 +43,29 @@ from supabase_store import (
     save_conversation as db_save_conversation,
     save_profile as db_save_profile,
 )
-from google_connections import delete_google_connection, get_google_connection, google_credentials, save_google_tokens
+from google_connections import (
+    connection_is_usable,
+    delete_google_connection,
+    get_google_connection,
+    google_credentials,
+    save_google_tokens,
+    save_refreshed_credentials,
+)
 
 app = FastAPI(title="Cal API")
 api_key = os.getenv("API_KEY")
 if not api_key:
     raise ValueError("API_KEY not found — check your .env file")
 
+# A pinned version eventually stops being offered to new API keys, which looks
+# like a broken app. The alias tracks Google's current Flash model instead.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
 # Gemini receives these functions as tools so it can take calendar actions when needed.
 client = genai.Client(api_key=api_key)
-calendar_tools = []
+# Remembered facts for the user behind the current request. Calendar tools run
+# deep inside the Gemini SDK, so a context variable is how they reach them.
+USER_FACTS = ContextVar("user_profile_facts", default=())
 # Limit uploads to common schedule formats and a safe file size.
 SUPPORTED_SCHEDULE_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
 MAX_SCHEDULE_SIZE = 15 * 1024 * 1024
@@ -116,12 +131,19 @@ class GoogleTokenInput(BaseModel):
 async def calendar_user(user: AuthUser = Depends(current_user)) -> AuthUser:
     """Bind the signed-in user's stored Google credentials to this request."""
     credentials = await google_credentials(user)
-    if credentials.expired and credentials.refresh_token:
+    if credentials.expired:
+        if not credentials.refresh_token:
+            raise HTTPException(status_code=409, detail="Reconnect Google Calendar to continue.")
         try:
-            credentials.refresh(GoogleAuthRequest())
+            # Refreshing is a blocking HTTPS call, so keep it off the event loop.
+            await run_in_threadpool(credentials.refresh, GoogleAuthRequest())
         except Exception as exc:
+            # Google rejected the refresh token (revoked, or expired because the
+            # OAuth consent screen is still in Testing). Drop the dead row so the
+            # status endpoint stops advertising a connection that cannot work.
+            await delete_google_connection(user.id)
             raise HTTPException(status_code=409, detail="Reconnect Google Calendar to continue.") from exc
-        await save_google_tokens(user, credentials.token, credentials.refresh_token, 3600)
+        await save_refreshed_credentials(user, credentials)
     set_calendar_credentials(credentials)
     return user
 
@@ -149,7 +171,8 @@ async def update_profile(input_data: ProfileInput, user: AuthUser = Depends(curr
 @app.get("/api/auth/google/status")
 async def google_connection_status(user: AuthUser = Depends(current_user)):
     connection = await get_google_connection(user.id)
-    return {"connected": bool(connection), "email": connection.get("google_account_email") if connection else None}
+    # Report a dead connection as disconnected so the UI offers Connect again.
+    return {"connected": connection_is_usable(connection), "email": connection.get("google_account_email") if connection else None}
 
 
 @app.post("/api/auth/google/token")
@@ -178,6 +201,29 @@ async def get_or_create_conversation(user, conversation_id, first_message="New c
     return await db_create_conversation(user, conversation_title(first_message))
 
 
+async def load_user_facts(user: AuthUser) -> dict:
+    """Expose the signed-in user's remembered facts to the calendar guardrails."""
+    profile = await db_get_profile(user)
+    USER_FACTS.set(tuple(profile.get("facts") or ()))
+    return profile
+
+
+def with_gemini_retry(call, attempts: int = 3, delay: float = 2.0):
+    """Retry Gemini calls that fail only because the model is overloaded.
+
+    Flash models return 503 UNAVAILABLE under load and 429 when rate limited.
+    Both clear on their own, so a short backoff beats showing a hard error.
+    """
+    for attempt in range(attempts):
+        try:
+            return call()
+        except APIError as exc:
+            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            if status not in (429, 503) or attempt == attempts - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
 def clean_json(text):
     """Handle a model response whether it is plain JSON or wrapped in a code block."""
     text = text.strip()
@@ -191,11 +237,11 @@ def extract_schedule(file_bytes, mime_type, timezone):
     prompt = f"""Read this class schedule image or PDF. Extract classes accurately into JSON only—no markdown.
 Return exactly this shape: {{"classes":[{{"name":"", "days":["Monday"], "start_time":"HH:MM", "end_time":"HH:MM", "location":"" or null, "start_date":"YYYY-MM-DD" or null, "end_date":"YYYY-MM-DD" or null}}], "missing":["..."], "notes":["..."]}}.
 Use 24-hour time. Do not guess unreadable names, days, dates, locations, or term boundaries; place missing information in `missing` instead. The user's timezone is {timezone}."""
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = with_gemini_retry(lambda: client.models.generate_content(
+        model=MODEL,
         contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
         config=types.GenerateContentConfig(temperature=0),
-    )
+    ))
     # Only keep classes that have enough information to be reviewed safely.
     data = clean_json(response.text or "{}")
     classes = [item for item in data.get("classes", []) if item.get("name") and item.get("days") and item.get("start_time") and item.get("end_time")]
@@ -261,12 +307,17 @@ def first_class_occurrence(item, weekday, timezone):
     return datetime.combine(date, start_time, tzinfo=zone), datetime.combine(date, end_time, tzinfo=zone)
 
 
-def calendar_conflicts(start_text, end_text, timezone, location="", exclude_event_id=None):
-    """Find overlaps and short transitions for a proposed calendar time."""
+def calendar_conflicts(start_text, end_text, timezone, location="", exclude_event_id=None, events=None):
+    """Find overlaps and short transitions for a proposed calendar time.
+
+    Callers that test several candidate times can pass a pre-fetched event
+    list covering all of them, which avoids re-querying every calendar.
+    """
     start, end = datetime.fromisoformat(start_text), datetime.fromisoformat(end_text)
     if start.tzinfo is None: start = start.replace(tzinfo=ZoneInfo(timezone))
     if end.tzinfo is None: end = end.replace(tzinfo=ZoneInfo(timezone))
-    events = calendar_events(start - timedelta(minutes=15), end + timedelta(minutes=15))
+    if events is None:
+        events = calendar_events(start - timedelta(minutes=15), end + timedelta(minutes=15))
     overlaps, transitions = [], []
     for event in events:
         if event.get("id") == exclude_event_id: continue
@@ -283,9 +334,9 @@ def calendar_conflicts(start_text, end_text, timezone, location="", exclude_even
 
 def preference_warnings(start_text, end_text):
     """Apply simple guardrails based on the user facts Cal has learned."""
-    # User-specific preferences are injected into chat instructions. Calendar
-    # tool calls avoid reading any shared local profile file.
-    facts = ""
+    # Facts come from the per-request context variable, so one user's
+    # preferences can never leak into another user's calendar checks.
+    facts = " ".join(USER_FACTS.get()).lower()
     start, end = datetime.fromisoformat(start_text), datetime.fromisoformat(end_text)
     warnings = []
     if any(phrase in facts for phrase in ("avoid early", "not a morning", "hate mornings")) and start.hour < 9: warnings.append("This is before 9 AM, and you previously said you prefer to avoid early mornings.")
@@ -296,12 +347,19 @@ def preference_warnings(start_text, end_text):
 def suggest_open_times(start_text, end_text, timezone):
     """Offer nearby same-day alternatives with the same duration."""
     start = datetime.fromisoformat(start_text); end = datetime.fromisoformat(end_text); duration = end - start
+    if start.tzinfo is None: start = start.replace(tzinfo=ZoneInfo(timezone))
+    if end.tzinfo is None: end = end.replace(tzinfo=ZoneInfo(timezone))
+    offsets = (0.5, 1, 1.5, 2, -0.5, -1)
+    # One fetch spanning every candidate. Querying per candidate would hit each
+    # of the user's calendars six times over.
+    events = calendar_events(start + timedelta(hours=min(offsets)) - timedelta(minutes=15),
+                             start + timedelta(hours=max(offsets)) + duration + timedelta(minutes=15))
     suggestions = []
     # Check the nearest useful slots first, including a 30-minute opening after a meeting.
-    for offset in (0.5, 1, 1.5, 2, -0.5, -1):
+    for offset in offsets:
         candidate = start + timedelta(hours=offset); candidate_end = candidate + duration
         if candidate.hour < 7 or candidate_end.hour > 22: continue
-        if not calendar_conflicts(candidate.isoformat(), candidate_end.isoformat(), timezone)[0]: suggestions.append(candidate.strftime("%A at %-I:%M %p"))
+        if not calendar_conflicts(candidate.isoformat(), candidate_end.isoformat(), timezone, events=events)[0]: suggestions.append(candidate.strftime("%A at %-I:%M %p"))
     return suggestions[:2]
 
 
@@ -322,19 +380,11 @@ calendar_tools = [safe_create_calendar_event, delete_calendar_event, get_calenda
 
 
 def calendar_events(start: datetime, end: datetime):
-    """Read Google Calendar events that fall within one requested day."""
-    service = get_calendar_service()
+    """Read events across every calendar the user keeps visible, not just primary."""
     try:
-        result = service.events().list(
-            calendarId="primary",
-            timeMin=start.isoformat(),
-            timeMax=end.isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-        ).execute()
+        return list_events_in_window(start.isoformat(), end.isoformat())
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Calendar Error: {exc}") from exc
-    return result.get("items", [])
 
 
 def serialize_event(event, timezone: str):
@@ -343,6 +393,8 @@ def serialize_event(event, timezone: str):
     end = event.get("end", {})
     return {
         "id": event["id"],
+        # The timeline needs this to edit an event on a secondary calendar.
+        "calendarId": event.get("calendarId", "primary"),
         "title": event.get("summary") or "Untitled event",
         "description": event.get("description") or "",
         "location": event.get("location") or "",
@@ -381,35 +433,46 @@ async def get_calendar(
     user: AuthUser = Depends(calendar_user),
 ):
     try:
+        # ZoneInfo raises ZoneInfoNotFoundError (a KeyError) for unknown zones.
         zone = ZoneInfo(timezone)
         day = datetime.fromisoformat(date).replace(tzinfo=zone)
-    except ValueError as exc:
+    except (ValueError, ZoneInfoNotFoundError) as exc:
         raise HTTPException(status_code=400, detail="Invalid date or timezone") from exc
     # Fetch one day's events, then pair them with contextual prompt suggestions.
-    events = [serialize_event(event, timezone) for event in calendar_events(day, day + timedelta(days=1))]
+    raw_events = await run_in_threadpool(calendar_events, day, day + timedelta(days=1))
+    events = [serialize_event(event, timezone) for event in raw_events]
     return {"date": date, "events": events, "suggestions": build_suggestions(events, day, timezone)}
 
+def apply_event_update(event_id: str, input_data: "EventInput", timezone: str, calendar_id: str):
+    """Blocking half of the timeline editor save, run off the event loop."""
+    overlaps, transitions = calendar_conflicts(input_data.start, input_data.end, timezone, input_data.location, event_id)
+    warnings = preference_warnings(input_data.start, input_data.end)
+    if overlaps or transitions or warnings:
+        alternatives = suggest_open_times(input_data.start, input_data.end, timezone) if overlaps else []
+        raise HTTPException(status_code=409, detail={"reason": " ".join(([f"Overlaps with {', '.join(overlaps)}."] if overlaps else []) + transitions + warnings), "alternatives": alternatives})
+    service = get_calendar_service()
+    event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    event.update({"summary": input_data.title, "location": input_data.location, "description": input_data.description,
+      "start": {"dateTime": input_data.start, "timeZone": timezone}, "end": {"dateTime": input_data.end, "timeZone": timezone}})
+    saved = service.events().update(calendarId=calendar_id, eventId=event_id, body=event).execute()
+    saved["calendarId"] = calendar_id
+    return saved
+
+
 @app.put("/api/events/{event_id}")
-async def update_event(event_id: str, input_data: EventInput, timezone: str = "America/Toronto", user: AuthUser = Depends(calendar_user)):
+async def update_event(event_id: str, input_data: EventInput, timezone: str = "America/Toronto", calendar_id: str = "primary", user: AuthUser = Depends(calendar_user)):
     """Update one Google Calendar event directly from the timeline editor."""
+    await load_user_facts(user)
     try:
-        overlaps, transitions = calendar_conflicts(input_data.start, input_data.end, timezone, input_data.location, event_id)
-        warnings = preference_warnings(input_data.start, input_data.end)
-        if overlaps or transitions or warnings:
-            alternatives = suggest_open_times(input_data.start, input_data.end, timezone) if overlaps else []
-            raise HTTPException(status_code=409, detail={"reason": " ".join(([f"Overlaps with {', '.join(overlaps)}."] if overlaps else []) + transitions + warnings), "alternatives": alternatives})
-        event = get_calendar_service().events().get(calendarId="primary", eventId=event_id).execute()
-        event.update({"summary": input_data.title, "location": input_data.location, "description": input_data.description,
-          "start": {"dateTime": input_data.start, "timeZone": timezone}, "end": {"dateTime": input_data.end, "timeZone": timezone}})
-        saved = get_calendar_service().events().update(calendarId="primary", eventId=event_id, body=event).execute()
+        saved = await run_in_threadpool(apply_event_update, event_id, input_data, timezone, calendar_id)
         return serialize_event(saved, timezone)
     except HTTPException: raise
     except Exception as exc: raise HTTPException(status_code=502, detail=f"Calendar update failed: {exc}") from exc
 
 @app.delete("/api/events/{event_id}")
-async def delete_event(event_id: str, user: AuthUser = Depends(calendar_user)):
+async def delete_event(event_id: str, calendar_id: str = "primary", user: AuthUser = Depends(calendar_user)):
     try:
-        get_calendar_service().events().delete(calendarId="primary", eventId=event_id).execute()
+        await run_in_threadpool(lambda: get_calendar_service().events().delete(calendarId=calendar_id, eventId=event_id).execute())
         return {"message": "Event deleted."}
     except Exception as exc: raise HTTPException(status_code=502, detail=f"Calendar deletion failed: {exc}") from exc
 
@@ -449,7 +512,8 @@ async def upload_schedule(
     if not file_bytes or len(file_bytes) > MAX_SCHEDULE_SIZE:
         raise HTTPException(status_code=413, detail="Use a schedule file smaller than 15 MB.")
     try:
-        schedule = extract_schedule(file_bytes, mime_type, timezone)
+        # Gemini's SDK is synchronous; keep the long analysis off the event loop.
+        schedule = await run_in_threadpool(extract_schedule, file_bytes, mime_type, timezone)
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=422, detail="I couldn't read a class schedule from that file. Try a clearer image or PDF.") from exc
     except Exception as exc:
@@ -518,8 +582,10 @@ async def import_schedule(conversation_id: str, timezone: str = "America/Toronto
         raise HTTPException(status_code=404, detail="There is no pending schedule import in this chat.")
     classes = schedule["classes"]
     validate_schedule(classes)
-    created = 0
-    try:
+
+    def create_series():
+        """Blocking Google Calendar writes, reporting how far they got."""
+        created = 0
         for item in classes:
             term_end = datetime.fromisoformat(item["end_date"]).strftime("%Y%m%dT235959Z")
             for weekday in item["days"]:
@@ -532,13 +598,17 @@ async def import_schedule(conversation_id: str, timezone: str = "America/Toronto
                     recurrence=[f"RRULE:FREQ=WEEKLY;BYDAY={rrule_day};UNTIL={term_end}"],
                 )
                 if isinstance(result, str) and result.startswith('{"error"'):
-                    raise RuntimeError(result)
+                    raise RuntimeError(f"stopped after {created} recurring series: {result}")
                 created += 1
+        return created
+
+    try:
+        created = await run_in_threadpool(create_series)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Calendar import stopped after {created} recurring series: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Calendar import {exc}") from exc
     conversation.pop("pending_schedule", None)
     now = datetime.now().isoformat()
-    reply = f"Added {created} weekly class {'series' if created == 1 else 'series'} to Google Calendar."
+    reply = f"Added {created} weekly class {'series' if created == 1 else 'series in total'} to Google Calendar."
     conversation["messages"].append({"role": "bot", "text": reply, "created_at": now})
     await db_save_conversation(user, conversation)
     return {"message": reply, "created": created}
@@ -554,7 +624,8 @@ async def chat_with_ai(input_data: ChatInput, user: AuthUser = Depends(calendar_
     conversation["messages"].append({"role": "user", "text": input_data.message, "created_at": now})
     recent_messages = conversation["messages"][-12:]
     context = "\n".join(f"{item['role'].title()}: {item['text']}" for item in recent_messages)
-    profile = await db_get_profile(user)
+    # Loading the profile also arms the preference guardrails in the calendar tools.
+    profile = await load_user_facts(user)
     today = datetime.now(ZoneInfo(input_data.timezone)).strftime("%A, %Y-%m-%d")
     # Give each model request the current conversation and any pending import.
     instruction = f"""You are Cal, {input_data.name}'s thoughtful personal calendar assistant.
@@ -574,12 +645,20 @@ Long-term user profile: {json.dumps(profile)}
 Pending class-schedule import, if any:
 {json.dumps(conversation.get('pending_schedule', {}))}
 If there is a pending class-schedule import, ask for missing term dates or locations. Do not create any imported class events until the user explicitly confirms with a clear instruction such as “add all classes.” Once they confirm and all required dates are known, create every class as a weekly recurring Google Calendar event on each listed day through the term."""
+    def ask_cal():
+        """Blocking Gemini turn, including any calendar tool calls it makes."""
+        def once():
+            chat = client.chats.create(
+                model=MODEL,
+                config=types.GenerateContentConfig(tools=calendar_tools, temperature=0.5, system_instruction=instruction),
+            )
+            return chat.send_message(input_data.message)
+        return with_gemini_retry(once)
+
     try:
-        chat = client.chats.create(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(tools=calendar_tools, temperature=0.5, system_instruction=instruction),
-        )
-        response = chat.send_message(input_data.message)
+        # The SDK is synchronous and a turn with tool calls can take tens of
+        # seconds, which would otherwise stall every other request.
+        response = await run_in_threadpool(ask_cal)
         reply = response.text or "I couldn't create a response. Please try again."
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Backend Error: {exc}") from exc
@@ -588,7 +667,7 @@ If there is a pending class-schedule import, ask for missing term dates or locat
     conversation["messages"].append({"role": "bot", "text": reply, "created_at": datetime.now().isoformat()})
     # Quietly extract durable personal facts after each conversation turn.
     try:
-        learned = client.models.generate_content(model="gemini-2.5-flash", contents=f"Extract durable personal facts/preferences from this message only. Return JSON {{\"facts\":[\"...\"]}}. Do not include temporary plans, sensitive data, or guesses. Message: {input_data.message}", config=types.GenerateContentConfig(temperature=0))
+        learned = await run_in_threadpool(lambda: with_gemini_retry(lambda: client.models.generate_content(model=MODEL, contents=f"Extract durable personal facts/preferences from this message only. Return JSON {{\"facts\":[\"...\"]}}. Do not include temporary plans, sensitive data, or guesses. Message: {input_data.message}", config=types.GenerateContentConfig(temperature=0)), attempts=2))
         facts = clean_json(learned.text or "{}").get("facts", [])
         profile["facts"] = list(dict.fromkeys((profile.get("facts", []) + facts)))[-30:]
         await db_save_profile(user, {"facts": profile["facts"]})

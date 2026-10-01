@@ -70,7 +70,19 @@ export default function App() {
     try {
       setCalendarError(""); setCalendarLoading(true);
       const response = await apiFetch(`/api/calendar?date=${dateKey(selectedDate)}&timezone=${encodeURIComponent(timezone)}`);
-      if (!response.ok) throw new Error(await responseError(response, "Unable to load calendar"));
+      if (!response.ok) {
+        const message = await responseError(response, "Unable to load calendar");
+        // 409 means the stored Google tokens can no longer be refreshed. Clear
+        // the connected flag so the Connect button returns; otherwise the user
+        // is told to reconnect with no control that lets them do it.
+        if (response.status === 409) {
+          setGoogleConnected(false);
+          setCalendar({ events: [], suggestions: [] });
+          setCalendarError(message);
+          return;
+        }
+        throw new Error(message);
+      }
       setCalendar(await response.json());
     } catch (error) {
       setCalendar({ events: [], suggestions: [] });
@@ -159,7 +171,11 @@ export default function App() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, conversation_id: conversationId, timezone, name }),
       });
-      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `Request failed: ${response.status}`);
+      if (!response.ok) {
+        // Chat needs calendar access too, so recover the Connect button here as well.
+        if (response.status === 409) setGoogleConnected(false);
+        throw new Error((await response.json().catch(() => ({}))).detail || `Request failed: ${response.status}`);
+      }
       const reply = await response.json();
       setConversationId(reply.conversation_id);
       setMessages((old) => [...old, { role: "bot", text: reply.response }]);
@@ -251,7 +267,7 @@ function Composer({ input, setInput, textRef, fileRef, send, uploadSchedule, thi
 
 function Chat(props) {
   // Keep the calendar landing view until the first chat message is sent.
-  const { messages, thinking, input, setInput, textRef, scrollRef, send } = props;
+  const { messages, thinking, input, scrollRef } = props;
   if (!messages.length) return <section className="chat chat-landing"><Today {...props} compact /><Composer {...props} /></section>;
   const activity = input.toLowerCase().includes("schedule") || input.toLowerCase().includes("calendar") ? "Checking your calendar…" : "Cal is thinking…"; return <section className="chat conversation"><div className="messages" ref={scrollRef}>{messages.map((message, index) => <div className={`row ${message.role}`} key={`${message.created_at || "message"}-${index}`} ref={message.role === "bot" && index === messages.length - 1 ? props.latestBotMessageRef : null}><div className={`message ${message.error ? "error" : ""}`}>{message.role === "bot" ? <FormattedMessage text={message.text} /> : message.image_url ? <figure className="uploaded-image"><img src={message.image_url} alt={message.text || "Uploaded schedule"} /><figcaption>{message.text}</figcaption></figure> : message.text}</div></div>)}{props.pendingSchedule && <div className="row bot"><button className="schedule-review-button" onClick={() => props.setModal("schedule-review")}><img src={ScheduleReviewIcon} alt="" /><span>Review schedule</span><ChevronRight size={17} /></button></div>}{thinking && <div className="row bot"><div className="thinking-status"><div className="typing"><i /><i /><i /></div>{activity}</div></div>}</div><Composer {...props} /></section>;
 }
@@ -267,7 +283,16 @@ function ScheduleReview({ conversationId, pendingSchedule, setPendingSchedule, t
   const [saving, setSaving] = useState(false);
   const [termStart, setTermStart] = useState(pendingSchedule.classes[0]?.start_date || "");
   const [termEnd, setTermEnd] = useState(pendingSchedule.classes[0]?.end_date || "");
-  useEffect(() => { setClasses(pendingSchedule.classes); setTermStart(pendingSchedule.classes[0]?.start_date || ""); setTermEnd(pendingSchedule.classes[0]?.end_date || ""); }, [pendingSchedule]);
+  // Re-sync the editable copy when a freshly extracted schedule arrives. React
+  // recommends adjusting state during render over an effect, which also avoids
+  // rendering the previous schedule for one frame.
+  const [syncedSchedule, setSyncedSchedule] = useState(pendingSchedule);
+  if (syncedSchedule !== pendingSchedule) {
+    setSyncedSchedule(pendingSchedule);
+    setClasses(pendingSchedule.classes);
+    setTermStart(pendingSchedule.classes[0]?.start_date || "");
+    setTermEnd(pendingSchedule.classes[0]?.end_date || "");
+  }
   const updateClass = (index, field, value) => setClasses((old) => old.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
   const updateDay = (classIndex, dayIndex, day) => setClasses((old) => old.map((item, itemIndex) => itemIndex === classIndex ? { ...item, days: item.days.map((currentDay, currentIndex) => currentIndex === dayIndex ? day : currentDay) } : item));
   const addDay = (classIndex) => updateClass(classIndex, "days", [...classes[classIndex].days, "Monday"]);
@@ -320,7 +345,9 @@ function Profile({ name, setName, timezone, setTimezone, role, setRole, saveProf
 function EventEditor({ event, timezone, refresh, close }) {
   const [title, setTitle] = useState(event.title); const [location, setLocation] = useState(event.location); const [description, setDescription] = useState(event.description); const [saving, setSaving] = useState(false); const [warning, setWarning] = useState("");
   const call = async (url, options) => { const r = await apiFetch(url, options); const body = await r.json().catch(() => ({})); if (!r.ok) throw new Error(typeof body.detail === "object" ? `${body.detail.reason}${body.detail.alternatives?.length ? ` Try: ${body.detail.alternatives.join(" or ")}.` : ""}` : body.detail || "Something went wrong."); return body; };
-  const save = async () => { setSaving(true); setWarning(""); try { await call(`/api/events/${event.id}?timezone=${encodeURIComponent(timezone)}`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({title, location, description, start:event.start, end:event.end}) }); refresh(); close(); } catch (error) { setWarning(error.message); } finally { setSaving(false); } };
-  const remove = async () => { if (!confirm(`Delete ${event.title}?`)) return; setSaving(true); try { await call(`/api/events/${event.id}`, {method:"DELETE"}); refresh(); close(); } finally { setSaving(false); } };
+  // Events can live on a secondary calendar, so every write says which one.
+  const calendarParam = `calendar_id=${encodeURIComponent(event.calendarId || "primary")}`;
+  const save = async () => { setSaving(true); setWarning(""); try { await call(`/api/events/${event.id}?timezone=${encodeURIComponent(timezone)}&${calendarParam}`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({title, location, description, start:event.start, end:event.end}) }); refresh(); close(); } catch (error) { setWarning(error.message); } finally { setSaving(false); } };
+  const remove = async () => { if (!confirm(`Delete ${event.title}?`)) return; setSaving(true); try { await call(`/api/events/${event.id}?${calendarParam}`, {method:"DELETE"}); refresh(); close(); } finally { setSaving(false); } };
   return <section className="event-editor"><header><span className="badge">CALENDAR EVENT</span><h2>Edit your plan</h2><p>{event.allDay ? "All day" : `${formatTime(event.start, timezone)} – ${formatTime(event.end, timezone)}`}</p></header><div className="event-editor-fields"><label>Title<input value={title} onChange={e=>setTitle(e.target.value)} /></label><label>Location<input value={location} onChange={e=>setLocation(e.target.value)} placeholder="Add a location" /></label><label>Description<textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Add notes or details" rows="4" /></label></div>{warning && <p className="event-warning">{warning}</p>}<footer><button className="event-delete" onClick={remove} disabled={saving}>Delete event</button><button className="dark" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save changes"}</button></footer></section>;
 }

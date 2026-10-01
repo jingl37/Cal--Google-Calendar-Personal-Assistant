@@ -1,24 +1,34 @@
-import os.path
 import json
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone as utc_timezone
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.exceptions import RefreshError
 
 from dateutil import parser
 from zoneinfo import ZoneInfo
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 CURRENT_CREDENTIALS = ContextVar("google_calendar_credentials", default=None)
+# Listing calendars on every lookup is wasteful, so cache it per request.
+CALENDAR_IDS = ContextVar("readable_calendar_ids", default=None)
+# Resolving a title against the whole calendar matches events from years ago,
+# so title lookups only consider a window around today.
+NAME_LOOKUP_PAST = timedelta(days=30)
+NAME_LOOKUP_FUTURE = timedelta(days=365)
+# Read-only Google subscriptions. They are noise on the timeline and would
+# raise phantom "you are double booked" warnings against every holiday.
+IGNORED_CALENDAR_SUFFIXES = (
+    "#holiday@group.v.calendar.google.com",
+    "#contacts@group.v.calendar.google.com",
+    "#weeknum@group.v.calendar.google.com",
+)
 
 
 def set_calendar_credentials(credentials):
     """Bind one signed-in user's credentials to the current request context."""
     CURRENT_CREDENTIALS.set(credentials)
+    CALENDAR_IDS.set(None)
 
 
 def get_calendar_service():
@@ -28,6 +38,66 @@ def get_calendar_service():
         raise RuntimeError("Google Calendar is not connected for this user.")
     service = build('calendar', 'v3', credentials=creds)
     return service
+
+
+def readable_calendar_ids():
+    """Every calendar Cal should read from.
+
+    Users keep most of their life on secondary calendars, so reading only
+    "primary" shows an almost empty day. Holiday and birthday feeds are left
+    out because they are noise on a timeline and would clash with everything.
+
+    The sidebar "selected" checkbox is deliberately ignored: un-ticking a
+    calendar in Google's UI is about decluttering that view, and letting it
+    silently hide a whole schedule from Cal is far more confusing than
+    showing one extra calendar. Calendars the user explicitly hid are still
+    excluded, via showHidden=False.
+    """
+    cached = CALENDAR_IDS.get()
+    if cached is not None:
+        return cached
+    service = get_calendar_service()
+    ids, page_token = [], None
+    while True:
+        result = service.calendarList().list(pageToken=page_token, showHidden=False).execute()
+        for calendar in result.get("items", []):
+            calendar_id = calendar.get("id", "")
+            if calendar.get("deleted") or any(calendar_id.endswith(suffix) for suffix in IGNORED_CALENDAR_SUFFIXES):
+                continue
+            ids.append(calendar_id)
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+    ids = ids or ["primary"]
+    CALENDAR_IDS.set(ids)
+    return ids
+
+
+def list_events_in_window(start_iso: str, end_iso: str, single_events: bool = True):
+    """Collect events across every readable calendar, tagged with their source."""
+    service = get_calendar_service()
+    collected = []
+    for calendar_id in readable_calendar_ids():
+        page_token = None
+        while True:
+            request = service.events().list(
+                calendarId=calendar_id,
+                timeMin=start_iso,
+                timeMax=end_iso,
+                singleEvents=single_events,
+                pageToken=page_token,
+                maxResults=250,
+                **({"orderBy": "startTime"} if single_events else {}),
+            )
+            result = request.execute()
+            for item in result.get("items", []):
+                # Remember the owning calendar so edits and deletes can find it.
+                item["calendarId"] = calendar_id
+                collected.append(item)
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+    return sorted(collected, key=event_start)
 
 def create_new_calendar_event(
         summary: str,
@@ -51,8 +121,6 @@ def create_new_calendar_event(
         recurrence: A list of RFC 5545 recurrence rule strings (e.g., ['FREQ=DAILY'])
     """
     service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service. Check authentication."})
 
     event = {
   "summary": summary,
@@ -80,50 +148,69 @@ def create_new_calendar_event(
 
     return f"Event \"{summary}\" created!"
 
-def get_calendar_event_id(event_name: str):
-    """Internal helper to return event id by event name"""
-    event_id = None
+def event_start(event):
+    """Sortable start moment for an event, tolerating all-day and malformed entries."""
+    value = event.get("start", {})
+    text = value.get("dateTime") or value.get("date")
+    if not text:
+        return datetime.max.replace(tzinfo=utc_timezone.utc)
+    moment = parser.isoparse(text)
+    return moment if moment.tzinfo else moment.replace(tzinfo=utc_timezone.utc)
 
+
+def describe_event(event):
+    """Short human label used when several events share a title."""
+    start = event.get("start", {})
+    return f"{event.get('summary', 'Untitled')} on {(start.get('dateTime') or start.get('date') or 'an unknown date')[:10]}"
+
+
+def find_events_by_name(event_name: str, on_date: str = None):
+    """Internal helper returning every event near today whose title matches.
+
+    Recurring events are left unexpanded so that acting on a class series
+    affects the whole series rather than a single arbitrary instance.
+    """
+    now = datetime.now(utc_timezone.utc)
+    wanted = event_name.strip().lower()
+    candidates = list_events_in_window(
+        (now - NAME_LOOKUP_PAST).isoformat(),
+        (now + NAME_LOOKUP_FUTURE).isoformat(),
+        single_events=False,
+    )
+    matches = [item for item in candidates if (item.get("summary") or "").strip().lower() == wanted]
+    if on_date:
+        matches = [item for item in matches if str(event_start(item).date()) == on_date]
+    return sorted(matches, key=event_start)
+
+
+def resolve_event(event_name: str, on_date: str = None):
+    """Pick the one event a title refers to, or explain why it is ambiguous."""
+    matches = find_events_by_name(event_name, on_date)
+    if not matches:
+        return None, f'Event "{event_name}" not found.'
+    if len(matches) > 1:
+        options = "; ".join(describe_event(item) for item in matches[:5])
+        return None, f'Several events are called "{event_name}" ({options}). Ask the user which date they mean and pass it as on_date.'
+    return matches[0], None
+
+def delete_calendar_event(event_name: str, on_date: str = None):
+    """
+    Delete an event from the calendar using its summary/title name.
+
+    Args:
+        event_name: The exact title of the event to delete (e.g., 'Math Class').
+        on_date: Optional 'YYYY-MM-DD' date used to choose between events sharing a title.
+    """
     service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service. Check authentication."})
-
-    page_token = None
-    while True:
-        try:
-            events_result = service.events().list(
-                calendarId="primary", pageToken=page_token, maxResults=250
-            ).execute()
-        except HttpError as e:
-            return json.dumps({"error": f"Failed to list events: {e.reason}", "status_code": e.resp.status})
-
-        events = events_result.get("items", [])
-        for event in events:
-            if event.get("summary") == event_name:
-                return event["id"]
-
-        page_token = events_result.get('nextPageToken')
-        if not page_token:
-            break
-
-    return None
-
-def delete_calendar_event(event_name: str):
-    """Delete an event from calender using its summary/title name"""
-    service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service. Check authentication."})
-
-    event_id = get_calendar_event_id(event_name)
-
-    if event_id is None:
-        return f'Event "{event_name}" not found.'
 
     try:
-        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        event, problem = resolve_event(event_name, on_date)
+        if problem:
+            return problem
+        service.events().delete(calendarId=event.get("calendarId", "primary"), eventId=event["id"]).execute()
     except HttpError as e:
-
-        if e.resp.status == 410:
+        # A 410 means the event was already removed, which is the desired end state.
+        if e.resp.status in (404, 410):
             return f"Event \"{event_name}\" deleted!"
         return json.dumps({"error": f"Failed to delete event: {e.reason}", "status_code": e.resp.status})
 
@@ -137,33 +224,13 @@ def get_calendar_event(start_date_time: str, end_date_time: str):
         start_date_time: Start window in ISO 8601 format (e.g., '2026-06-09T00:00:00Z').
         end_date_time: End window in ISO 8601 format (e.g., '2026-06-09T23:59:59Z').
     """
-    service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service. Check authentication."})
+    try:
+        # Recurring series are expanded so each real meeting is counted.
+        return list_events_in_window(start_date_time, end_date_time)
+    except HttpError as e:
+        return json.dumps({"error": f"Failed to fetch events: {e.reason}", "status_code": e.resp.status})
 
-    page_token = None
-    all_events = []
-    while True:
-        try:
-            events_result = service.events().list(
-                calendarId="primary",
-                timeMin=start_date_time,
-                timeMax=end_date_time,
-                pageToken=page_token,
-                maxResults=250
-            ).execute()
-        except HttpError as e:
-            return json.dumps({"error": f"Failed to fetch events: {e.reason}", "status_code": e.resp.status})
-
-        events = events_result.get("items", [])
-        all_events.extend(events)
-        page_token = events_result.get('nextPageToken')
-        if not page_token:
-            break
-
-    return all_events
-
-def update_calendar_event(event_name: str, changes_to_event: dict):
+def update_calendar_event(event_name: str, changes_to_event: dict, on_date: str = None):
     """
     Updates event by event name
 
@@ -176,21 +243,18 @@ def update_calendar_event(event_name: str, changes_to_event: dict):
             - 'description': (str) New description.
             - 'start': (dict) New start time, e.g., {'dateTime': '2026-06-09T14:00:00', 'timeZone': 'UTC'}
             - 'end': (dict) New end time, e.g., {'dateTime': '2026-06-09T15:00:00', 'timeZone': 'UTC'}
+        on_date: Optional 'YYYY-MM-DD' date used to choose between events sharing a title.
 
     """
     service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service. Check authentication."})
-
-    event_id = get_calendar_event_id(event_name)
-
-    if event_id is None:
-        return f'Event "{event_name}" not found.'
 
     try:
-        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        event, problem = resolve_event(event_name, on_date)
+        if problem:
+            return problem
+        calendar_id = event.pop("calendarId", "primary")
         event.update(changes_to_event)
-        service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+        service.events().update(calendarId=calendar_id, eventId=event["id"], body=event).execute()
     except HttpError as e:
         return json.dumps({"error": f"Failed to update event: {e.reason}", "status_code": e.resp.status})
 
@@ -221,26 +285,14 @@ def get_calendar_free_slot(date: str, time_zone: str, start_time: str = "T00:00:
         start_time: Optional limit start (e.g., 'T09:00:00').
         end_time: Optional limit end (e.g., 'T17:00:00').
     """
-    service = get_calendar_service()
-    if not service:
-        return json.dumps({"error": "Failed to get Google Calendar service."})
-
     # build ISO timestamps for the window boundaries
     window_start = parser.isoparse(f"{date}{start_time}").replace(tzinfo=ZoneInfo(time_zone))
     window_end = parser.isoparse(f"{date}{end_time}").replace(tzinfo=ZoneInfo(time_zone))
 
     try:
-        events_result = service.events().list(
-            calendarId="primary",
-            timeMin=window_start.isoformat(),
-            timeMax=window_end.isoformat(),
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
+        events = list_events_in_window(window_start.isoformat(), window_end.isoformat())
     except HttpError as e:
         return json.dumps({"error": f"Failed to fetch events: {e.reason}", "status_code": e.resp.status})
-
-    events = events_result.get("items", [])
 
     taken_slots = []
 
@@ -272,15 +324,3 @@ def get_calendar_free_slot(date: str, time_zone: str, start_time: str = "T00:00:
         free_slots.append(f"{current.isoformat()} → {window_end.isoformat()}")
 
     return free_slots
-
-if __name__ == "__main__":
-  get_calendar_service()
-#   print(get_calendar_event("2026-07-01T00:00:00-04:00", "2026-07-01T23:00:00-04:00"))
-  print(get_calendar_free_slot("2026-07-01", "America/New_York"))
-#   delete_calendar_event("Test Event")
-#   create_new_calendar_event(
-#     summary="Test Event",
-#     start_time="2026-04-05T10:00:00",
-#     end_time="2026-04-05T11:00:00",
-#     time_zone="America/New_York"
-# )
