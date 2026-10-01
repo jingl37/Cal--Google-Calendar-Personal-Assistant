@@ -60,6 +60,9 @@ if not api_key:
 # A pinned version eventually stops being offered to new API keys, which looks
 # like a broken app. The alias tracks Google's current Flash model instead.
 MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# The full Flash models shed load with 503s and burn free-tier quota with 429s.
+# The Lite tier stays available, so fall back to it rather than failing a chat.
+MODEL_CHAIN = list(dict.fromkeys([MODEL, "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]))
 
 # Gemini receives these functions as tools so it can take calendar actions when needed.
 client = genai.Client(api_key=api_key)
@@ -208,20 +211,33 @@ async def load_user_facts(user: AuthUser) -> dict:
     return profile
 
 
-def with_gemini_retry(call, attempts: int = 3, delay: float = 2.0):
-    """Retry Gemini calls that fail only because the model is overloaded.
+class GeminiUnavailable(Exception):
+    """Every model in the chain was overloaded or rate limited."""
 
-    Flash models return 503 UNAVAILABLE under load and 429 when rate limited.
-    Both clear on their own, so a short backoff beats showing a hard error.
+
+def call_gemini(make_call, attempts: int = 2, delay: float = 1.5):
+    """Run a Gemini call, retrying overload and then falling back a tier.
+
+    `make_call` takes a model name. Flash returns 503 UNAVAILABLE under load
+    and 429 once free-tier quota is gone; both are transient for that model
+    but can persist for minutes, so after a brief retry we move down the
+    chain to a Lite model rather than failing the user's message.
     """
-    for attempt in range(attempts):
-        try:
-            return call()
-        except APIError as exc:
-            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            if status not in (429, 503) or attempt == attempts - 1:
-                raise
-            time.sleep(delay * (attempt + 1))
+    last = None
+    for model in MODEL_CHAIN:
+        for attempt in range(attempts):
+            try:
+                return make_call(model)
+            except APIError as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                if status not in (429, 503, 404):
+                    raise
+                last = exc
+                if status != 404 and attempt < attempts - 1:
+                    time.sleep(delay * (attempt + 1))
+                if status == 404:
+                    break
+    raise GeminiUnavailable(str(last))
 
 
 def clean_json(text):
@@ -237,8 +253,8 @@ def extract_schedule(file_bytes, mime_type, timezone):
     prompt = f"""Read this class schedule image or PDF. Extract classes accurately into JSON only—no markdown.
 Return exactly this shape: {{"classes":[{{"name":"", "days":["Monday"], "start_time":"HH:MM", "end_time":"HH:MM", "location":"" or null, "start_date":"YYYY-MM-DD" or null, "end_date":"YYYY-MM-DD" or null}}], "missing":["..."], "notes":["..."]}}.
 Use 24-hour time. Do not guess unreadable names, days, dates, locations, or term boundaries; place missing information in `missing` instead. The user's timezone is {timezone}."""
-    response = with_gemini_retry(lambda: client.models.generate_content(
-        model=MODEL,
+    response = call_gemini(lambda model: client.models.generate_content(
+        model=model,
         contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
         config=types.GenerateContentConfig(temperature=0),
     ))
@@ -626,10 +642,15 @@ async def chat_with_ai(input_data: ChatInput, user: AuthUser = Depends(calendar_
     context = "\n".join(f"{item['role'].title()}: {item['text']}" for item in recent_messages)
     # Loading the profile also arms the preference guardrails in the calendar tools.
     profile = await load_user_facts(user)
-    today = datetime.now(ZoneInfo(input_data.timezone)).strftime("%A, %Y-%m-%d")
+    now_local = datetime.now(ZoneInfo(input_data.timezone))
+    today = now_local.strftime("%A, %Y-%m-%d")
+    # Without the clock time, "tonight" or "later" cannot be placed relative to
+    # now, and Cal answers questions about times that have already passed.
+    current_time = now_local.strftime("%-I:%M %p")
     # Give each model request the current conversation and any pending import.
     instruction = f"""You are Cal, {input_data.name}'s thoughtful personal calendar assistant.
-Today is {today}; their timezone is {input_data.timezone}.
+Today is {today} and the current local time is {current_time}; their timezone is {input_data.timezone}.
+Words like "tonight", "later", "this afternoon" are relative to that current time. If the user asks about a time that has already passed today, say so rather than answering as if it were still upcoming.
 You can access their Google Calendar to create, delete, update events and find availability. Always use safe_create_calendar_event to create an event. If it returns needs_confirmation, explain the concern, offer any alternatives, and ask whether the user wants to keep the proposed time anyway. Only call it again with confirmed=true after the user clearly says yes. This applies to overlaps, tight transitions, and preference warnings.
 Use the conversation memory below to make advice and planning suggestions personal. If it lacks useful details, offer a simple, practical suggestion instead of inventing facts.
 When the user wants to schedule or find time for something, ask focused follow-up questions if necessary: preferred day or deadline, duration, location/travel needs, and any priority or time-of-day preference. Do not ask questions you can answer from their calendar or remembered facts.
@@ -647,19 +668,22 @@ Pending class-schedule import, if any:
 If there is a pending class-schedule import, ask for missing term dates or locations. Do not create any imported class events until the user explicitly confirms with a clear instruction such as “add all classes.” Once they confirm and all required dates are known, create every class as a weekly recurring Google Calendar event on each listed day through the term."""
     def ask_cal():
         """Blocking Gemini turn, including any calendar tool calls it makes."""
-        def once():
+        def once(model):
             chat = client.chats.create(
-                model=MODEL,
+                model=model,
                 config=types.GenerateContentConfig(tools=calendar_tools, temperature=0.5, system_instruction=instruction),
             )
             return chat.send_message(input_data.message)
-        return with_gemini_retry(once)
+        return call_gemini(once)
 
     try:
         # The SDK is synchronous and a turn with tool calls can take tens of
         # seconds, which would otherwise stall every other request.
         response = await run_in_threadpool(ask_cal)
         reply = response.text or "I couldn't create a response. Please try again."
+    except GeminiUnavailable as exc:
+        # Raw provider JSON is noise to the user; say what happened plainly.
+        raise HTTPException(status_code=503, detail="Cal is busy right now — Google's model is overloaded. Try again in a moment.") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Backend Error: {exc}") from exc
 
@@ -667,7 +691,7 @@ If there is a pending class-schedule import, ask for missing term dates or locat
     conversation["messages"].append({"role": "bot", "text": reply, "created_at": datetime.now().isoformat()})
     # Quietly extract durable personal facts after each conversation turn.
     try:
-        learned = await run_in_threadpool(lambda: with_gemini_retry(lambda: client.models.generate_content(model=MODEL, contents=f"Extract durable personal facts/preferences from this message only. Return JSON {{\"facts\":[\"...\"]}}. Do not include temporary plans, sensitive data, or guesses. Message: {input_data.message}", config=types.GenerateContentConfig(temperature=0)), attempts=2))
+        learned = await run_in_threadpool(lambda: call_gemini(lambda model: client.models.generate_content(model=model, contents=f"Extract durable personal facts/preferences from this message only. Return JSON {{\"facts\":[\"...\"]}}. Do not include temporary plans, sensitive data, or guesses. Message: {input_data.message}", config=types.GenerateContentConfig(temperature=0)), attempts=1))
         facts = clean_json(learned.text or "{}").get("facts", [])
         profile["facts"] = list(dict.fromkeys((profile.get("facts", []) + facts)))[-30:]
         await db_save_profile(user, {"facts": profile["facts"]})
